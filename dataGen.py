@@ -57,7 +57,7 @@ def main():
     
     for i in tqdm(range(NUM_SAMPLES)):
         # Randomly choose 5 or 6 characters
-        length = random.choice([5, 6])
+        length = 5
         text = generate_random_string(length)
         filename = f"synth_{i}.png"
         
