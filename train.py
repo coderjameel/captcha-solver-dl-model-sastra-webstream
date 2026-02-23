@@ -5,16 +5,16 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-from PIL import Image, ImageOps, ImageFilter
+from PIL import Image, ImageFilter
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
-# --- DGX Optimized Configuration ---
+# --- Configuration for DGX Node ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 IMG_WIDTH, IMG_HEIGHT = 200, 50
-BATCH_SIZE = 128  # Maximize DGX GPU memory
+BATCH_SIZE = 32         # Reduced to force more frequent weight updates
 EPOCHS = 200
-LEARNING_RATE = 0.001
+LEARNING_RATE = 0.0005  # Steady initial learning rate
 DATA_CSV = 'data_clean.csv'
 
 CHARS = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
@@ -24,7 +24,7 @@ NUM_CLASSES = len(CHARS) + 1
 
 # --- Advanced Preprocessing ---
 class CaptchaNoiseFilter:
-    """Applies a median filter to blur out the thin black lines while keeping thick text"""
+    """Applies a median filter to blur out thin background lines."""
     def __call__(self, img):
         img = img.convert('L')
         return img.filter(ImageFilter.MedianFilter(size=3))
@@ -54,7 +54,7 @@ def collate_fn(batch):
     target_lens = torch.cat(target_lens, 0)
     return images, targets_padded, target_lens, raw_labels
 
-# --- CTC Decoder for Accuracy ---
+# --- CTC Decoder & Metrics ---
 def greedy_decoder(logits):
     pred_indices = logits.argmax(2) 
     pred_indices = pred_indices.transpose(0, 1).cpu().numpy() 
@@ -137,12 +137,13 @@ def train():
     criterion = nn.CTCLoss(blank=0, zero_infinity=True)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     
-    scheduler = optim.lr_scheduler.CosineAnnealingWarmRestarts(optimizer, T_0=20, T_mult=1, eta_min=1e-6)
+    # Patient scheduler: Drops LR only if validation loss stops improving for 15 epochs
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=15, factor=0.5)
 
     best_word_acc = 0.0
 
     print("="*80)
-    print(f"🚀 INITIATING GOD-LEVEL TRAINING ON {DEVICE.type.upper()}")
+    print(f"🚀 INITIATING STABILIZED TRAINING ON {DEVICE.type.upper()}")
     print(f"Total Epochs: {EPOCHS} | Batch Size: {BATCH_SIZE} | Dataset: {len(df)} images")
     print("="*80)
 
@@ -191,14 +192,15 @@ def train():
         avg_val_loss = val_loss / len(test_loader)
         val_w_acc, val_c_acc = calculate_metrics(val_preds, val_targets)
         
-        scheduler.step()
+        # Step the scheduler based on the validation loss
+        scheduler.step(avg_val_loss)
         curr_lr = optimizer.param_groups[0]['lr']
 
         print(f"\n[EPOCH {epoch:03d}/{EPOCHS}] LR: {curr_lr:.6f}")
         print(f" ┣▶ TRAIN | Loss: {avg_train_loss:.4f} | Char Acc: {train_c_acc:5.2f}% | Word Acc: {train_w_acc:5.2f}%")
         print(f" ┗▶ TEST  | Loss: {avg_val_loss:.4f} | Char Acc: {val_c_acc:5.2f}% | Word Acc: {val_w_acc:5.2f}%")
         
-        if epoch % 10 == 0 or val_w_acc > 5.0:
+        if epoch % 5 == 0 or val_w_acc > 5.0:
             print(f"    * Sample - True: '{val_targets[0]}' | Pred: '{val_preds[0]}'")
 
         if val_w_acc >= best_word_acc and val_w_acc > 0:
