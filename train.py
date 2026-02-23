@@ -10,13 +10,12 @@ from sklearn.model_selection import train_test_split
 import shutil
 from tqdm import tqdm
 import matplotlib.pyplot as plt
-import numpy as np
 
 # --- Configuration & Hyperparameters ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 IMG_WIDTH = 200
 IMG_HEIGHT = 50
-BATCH_SIZE = 16
+BATCH_SIZE = 32 # Increased for DGX performance
 EPOCHS = 50
 LEARNING_RATE = 0.001
 DATA_CSV = 'data.csv'
@@ -26,14 +25,14 @@ IMG_DIR = 'captchas/'
 CHARS = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 CHAR_MAP = {char: i + 1 for i, char in enumerate(CHARS)}
 REV_MAP = {i + 1: char for i, char in enumerate(CHARS)}
-NUM_CLASSES = len(CHARS) + 1  # +1 for CTC blank token
+NUM_CLASSES = len(CHARS) + 1  
 
 # --- Data Preparation ---
 def setup_dataset():
-    # Check if folders already exist and contain files
+    # Improved check: only run setup if dataset folders are missing or empty
     if os.path.exists('dataset/train') and os.path.exists('dataset/test'):
-        if len(os.listdir('dataset/train')) > 1: # Checking for more than just labels.csv
-            print(">>> Dataset already split and organized. Skipping setup.")
+        if len(os.listdir('dataset/train')) > 1:
+            print(">>> Dataset already split and organized in ~/mlPro/dataset. Skipping setup.")
             train_df = pd.read_csv('dataset/train/labels.csv')
             test_df = pd.read_csv('dataset/test/labels.csv')
             return train_df, test_df
@@ -46,12 +45,14 @@ def setup_dataset():
         if os.path.exists(folder): shutil.rmtree(folder)
         os.makedirs(folder)
 
-    # Save splits and copy files
     train_df.to_csv('dataset/train/labels.csv', index=False)
     test_df.to_csv('dataset/test/labels.csv', index=False)
     
-    for _, row in df.iterrows():
-        dest = 'dataset/train' if row['filename'] in train_df['filename'].values else 'dataset/test'
+    # Efficient set-based lookup for splitting
+    train_filenames = set(train_df['filename'].values)
+    
+    for _, row in tqdm(df.iterrows(), total=len(df), desc="Moving files"):
+        dest = 'dataset/train' if row['filename'] in train_filenames else 'dataset/test'
         shutil.copy(os.path.join(IMG_DIR, row['filename']), os.path.join(dest, row['filename']))
     
     return train_df, test_df
@@ -76,12 +77,13 @@ class CaptchaDataset(Dataset):
 def collate_fn(batch):
     images, targets, target_lens = zip(*batch)
     images = torch.stack(images, 0)
-    # Pad sequences to handle varying lengths (e.g., 5 vs 6 chars)
+    # Handles varying captcha lengths (5 vs 6 characters)
     targets_padded = torch.nn.utils.rnn.pad_sequence(targets, batch_first=True, padding_value=0)
     target_lens = torch.cat(target_lens, 0)
     return images, targets_padded, target_lens
 
 # --- Model Architecture ---
+
 class CRNN(nn.Module):
     def __init__(self, num_classes):
         super(CRNN, self).__init__()
@@ -91,16 +93,21 @@ class CRNN(nn.Module):
             nn.Conv2d(128, 256, 3, 1, 1), nn.BatchNorm2d(256), nn.ReLU(),
             nn.Conv2d(256, 256, 3, 1, 1), nn.ReLU(), nn.MaxPool2d((2, 1))
         )
-        self.rnn = nn.LSTM(256, 128, bidirectional=True, num_layers=2, batch_first=False)
-        self.fc = nn.Linear(256, num_classes)
+        
+        # Fixed Dimension: 256 channels * 6 (remaining height after pooling) = 1536
+        self.rnn_input_size = 1536 
+        self.rnn = nn.LSTM(self.rnn_input_size, 256, bidirectional=True, num_layers=2, batch_first=False)
+        self.fc = nn.Linear(512, num_classes) # 256*2 for bidirectional
 
     def forward(self, x):
         x = self.cnn(x) 
-        x = x.permute(3, 0, 1, 2) 
-        w, b, c, h = x.size()
-        x = x.view(w, b, c * h)
+        b, c, h, w = x.size()
+        x = x.permute(3, 0, 1, 2) # [W, B, C, H]
+        x = x.view(w, b, c * h)    # Flatten C and H into the sequence dimension
+        
         x, _ = self.rnn(x)
-        return self.fc(x)
+        x = self.fc(x)
+        return x
 
 def train():
     train_df, test_df = setup_dataset()
@@ -123,12 +130,13 @@ def train():
     best_loss = float('inf')
 
     print(f"Starting training on {DEVICE}...")
+    
     for epoch in range(1, EPOCHS + 1):
         model.train()
         t_loss = 0
         loop = tqdm(train_loader, leave=False, desc=f"Epoch [{epoch}/{EPOCHS}]")
         for imgs, targets, target_lens in loop:
-            imgs = imgs.to(DEVICE)
+            imgs, targets = imgs.to(DEVICE), targets.to(DEVICE)
             optimizer.zero_grad()
             logits = model(imgs)
             
@@ -139,13 +147,14 @@ def train():
             loss.backward()
             optimizer.step()
             t_loss += loss.item()
-            loop.set_postfix(loss=loss.item())
+            loop.set_postfix(loss=f"{loss.item():.4f}")
 
+        # Validation phase
         model.eval()
         v_loss = 0
         with torch.no_grad():
             for imgs, targets, target_lens in test_loader:
-                imgs = imgs.to(DEVICE)
+                imgs, targets = imgs.to(DEVICE), targets.to(DEVICE)
                 logits = model(imgs)
                 log_probs = nn.functional.log_softmax(logits, dim=2)
                 input_lens = torch.full(size=(imgs.size(0),), fill_value=logits.size(0), dtype=torch.int32)
@@ -161,14 +170,18 @@ def train():
         if avg_test < best_loss:
             best_loss = avg_test
             torch.save(model.state_dict(), "best_model.pth")
+            print(f"--> Saved Best Model (Loss: {best_loss:.4f})")
 
+    # Plotting results
     plt.figure(figsize=(10, 5))
     plt.plot(history['train_loss'], label='Train Loss')
     plt.plot(history['test_loss'], label='Test Loss')
-    plt.title('Training Metrics - Captcha Solver')
+    plt.xlabel('Epochs')
+    plt.ylabel('Loss')
+    plt.title('Training Metrics - SASTRA Webstream Captcha')
     plt.legend()
     plt.savefig('training_metrics.png')
-    print("Training Complete. Model saved as best_model.pth")
+    print("Full training cycle complete. Visuals saved to training_metrics.png")
 
 if __name__ == "__main__":
     train()
