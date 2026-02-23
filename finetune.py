@@ -5,7 +5,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
-from PIL import Image, ImageFilter
+from PIL import Image
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
@@ -13,7 +13,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 IMG_WIDTH, IMG_HEIGHT = 200, 50
 BATCH_SIZE = 32         
 EPOCHS = 50             
-LEARNING_RATE = 0.0001  # Static, gentle learning rate
+LEARNING_RATE = 0.0005  # Slightly higher, but only applied to the RNN
 DATA_CSV = 'data_clean.csv'       
 IMG_DIR = 'captchas/'             
 
@@ -21,16 +21,6 @@ CHARS = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 CHAR_MAP = {char: i + 1 for i, char in enumerate(CHARS)}
 REV_MAP = {i + 1: char for i, char in enumerate(CHARS)}
 NUM_CLASSES = len(CHARS) + 1  
-
-# --- THE MAGIC FIX: Make Real Data look Synthetic ---
-class CaptchaBinarizeFilter:
-    def __call__(self, img):
-        img = img.convert('L')
-        # 1. Blur the thin line slightly
-        img = img.filter(ImageFilter.MedianFilter(size=3))
-        # 2. Force all gray/fuzzy pixels to pure black or pure white
-        # This removes the "Domain Gap" between real and synthetic
-        return img.point(lambda p: 255 if p > 140 else 0)
 
 class CaptchaDataset(Dataset):
     def __init__(self, df, root_dir, transform=None):
@@ -40,7 +30,8 @@ class CaptchaDataset(Dataset):
 
     def __getitem__(self, idx):
         img_name = os.path.join(self.root_dir, str(self.df.iloc[idx, 0]))
-        image = Image.open(img_name)
+        # Simple grayscale conversion, no heavy filters
+        image = Image.open(img_name).convert('L')
         
         label_str = str(self.df.iloc[idx, 1])
         label_indices = [CHAR_MAP[c] for c in label_str if c in CHAR_MAP]
@@ -106,9 +97,8 @@ def finetune():
     df = pd.read_csv(DATA_CSV)
     train_df, test_df = train_test_split(df, test_size=0.1, random_state=42)
 
-    # REMOVED Rotation and Jitter. Just binarize and resize.
+    # Bare minimum transforms so we don't distort the real images
     transform = transforms.Compose([
-        CaptchaBinarizeFilter(),
         transforms.Resize((IMG_HEIGHT, IMG_WIDTH)),
         transforms.ToTensor(),
         transforms.Normalize((0.5,), (0.5,))
@@ -126,17 +116,22 @@ def finetune():
         model.load_state_dict(torch.load("synthetic_best_model.pth", map_location=DEVICE, weights_only=True))
         print("✅ Pre-trained weights loaded successfully!")
     except Exception as e:
-        print(f"❌ Error loading weights: {e}")
+        print(f"❌ Error loading weights: {e}\n Make sure you run the synthetic training first!")
         return
 
+    # --- THE MAGIC FIX: FREEZE THE CNN BACKBONE ---
+    print("🔒 Freezing CNN layers to prevent Catastrophic Forgetting...")
+    for param in model.cnn.parameters():
+        param.requires_grad = False
+    
+    # We ONLY pass the RNN and FC parameters to the optimizer
     criterion = nn.CTCLoss(blank=0, zero_infinity=True)
-    # Using Adam instead of AdamW, and NO scheduler so the LR stays at 0.0001
-    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+    optimizer = optim.Adam(list(model.rnn.parameters()) + list(model.fc.parameters()), lr=LEARNING_RATE)
 
     best_word_acc = 0.0
 
     print("="*80)
-    print(f"🎯 INITIATING FINE-TUNING ON {DEVICE.type.upper()}")
+    print(f"🎯 INITIATING LOCKED-BACKBONE FINE-TUNING ON {DEVICE.type.upper()}")
     print("="*80)
 
     for epoch in range(1, EPOCHS + 1):
@@ -154,7 +149,7 @@ def finetune():
             
             loss = criterion(log_probs, targets, input_lens, target_lens)
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=2.0)
+            torch.nn.utils.clip_grad_norm_(model.rnn.parameters(), max_norm=2.0)
             optimizer.step()
             
             train_loss += loss.item()
