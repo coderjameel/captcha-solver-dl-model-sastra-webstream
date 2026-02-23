@@ -20,9 +20,9 @@ BATCH_SIZE = 16
 EPOCHS = 50
 LEARNING_RATE = 0.001
 DATA_CSV = 'data.csv'
-IMG_DIR = 'captchas'
+IMG_DIR = 'captchas/'
 
-# Define character set (alphanumeric)
+# Alphanumeric character set for SASTRA webstream
 CHARS = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 CHAR_MAP = {char: i + 1 for i, char in enumerate(CHARS)}
 REV_MAP = {i + 1: char for i, char in enumerate(CHARS)}
@@ -30,6 +30,15 @@ NUM_CLASSES = len(CHARS) + 1  # +1 for CTC blank token
 
 # --- Data Preparation ---
 def setup_dataset():
+    # Check if folders already exist and contain files
+    if os.path.exists('dataset/train') and os.path.exists('dataset/test'):
+        if len(os.listdir('dataset/train')) > 1: # Checking for more than just labels.csv
+            print(">>> Dataset already split and organized. Skipping setup.")
+            train_df = pd.read_csv('dataset/train/labels.csv')
+            test_df = pd.read_csv('dataset/test/labels.csv')
+            return train_df, test_df
+
+    print(">>> Organizing dataset for the first time...")
     df = pd.read_csv(DATA_CSV)
     train_df, test_df = train_test_split(df, test_size=0.1, random_state=42)
     
@@ -37,12 +46,12 @@ def setup_dataset():
         if os.path.exists(folder): shutil.rmtree(folder)
         os.makedirs(folder)
 
-    # Save splits and move files
+    # Save splits and copy files
     train_df.to_csv('dataset/train/labels.csv', index=False)
     test_df.to_csv('dataset/test/labels.csv', index=False)
     
     for _, row in df.iterrows():
-        dest = 'dataset/train' if _ in train_df.index else 'dataset/test'
+        dest = 'dataset/train' if row['filename'] in train_df['filename'].values else 'dataset/test'
         shutil.copy(os.path.join(IMG_DIR, row['filename']), os.path.join(dest, row['filename']))
     
     return train_df, test_df
@@ -56,13 +65,21 @@ class CaptchaDataset(Dataset):
     def __len__(self): return len(self.df)
 
     def __getitem__(self, idx):
-        img_name = os.path.join(self.root_dir, self.df.iloc[idx, 0])
-        image = Image.open(img_name).convert('L') # Grayscale
+        img_name = os.path.join(self.root_dir, str(self.df.iloc[idx, 0]))
+        image = Image.open(img_name).convert('L') 
         label_str = str(self.df.iloc[idx, 1])
-        label = [CHAR_MAP[c] for c in label_str]
+        label = torch.IntTensor([CHAR_MAP[c] for c in label_str])
         
         if self.transform: image = self.transform(image)
-        return image, torch.IntTensor(label), torch.IntTensor([len(label)])
+        return image, label, torch.IntTensor([len(label)])
+
+def collate_fn(batch):
+    images, targets, target_lens = zip(*batch)
+    images = torch.stack(images, 0)
+    # Pad sequences to handle varying lengths (e.g., 5 vs 6 chars)
+    targets_padded = torch.nn.utils.rnn.pad_sequence(targets, batch_first=True, padding_value=0)
+    target_lens = torch.cat(target_lens, 0)
+    return images, targets_padded, target_lens
 
 # --- Model Architecture ---
 class CRNN(nn.Module):
@@ -78,13 +95,12 @@ class CRNN(nn.Module):
         self.fc = nn.Linear(256, num_classes)
 
     def forward(self, x):
-        x = self.cnn(x) # [B, 256, H, W]
-        x = x.permute(3, 0, 1, 2) # [W, B, C, H]
+        x = self.cnn(x) 
+        x = x.permute(3, 0, 1, 2) 
         w, b, c, h = x.size()
         x = x.view(w, b, c * h)
         x, _ = self.rnn(x)
-        x = self.fc(x)
-        return x
+        return self.fc(x)
 
 def train():
     train_df, test_df = setup_dataset()
@@ -94,8 +110,10 @@ def train():
         transforms.Normalize((0.5,), (0.5,))
     ])
 
-    train_loader = DataLoader(CaptchaDataset(train_df, 'dataset/train', transform), batch_size=BATCH_SIZE, shuffle=True)
-    test_loader = DataLoader(CaptchaDataset(test_df, 'dataset/test', transform), batch_size=BATCH_SIZE)
+    train_loader = DataLoader(CaptchaDataset(train_df, 'dataset/train', transform), 
+                              batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
+    test_loader = DataLoader(CaptchaDataset(test_df, 'dataset/test', transform), 
+                             batch_size=BATCH_SIZE, collate_fn=collate_fn)
 
     model = CRNN(NUM_CLASSES).to(DEVICE)
     criterion = nn.CTCLoss(blank=0, zero_infinity=True)
@@ -104,10 +122,11 @@ def train():
     history = {'train_loss': [], 'test_loss': []}
     best_loss = float('inf')
 
+    print(f"Starting training on {DEVICE}...")
     for epoch in range(1, EPOCHS + 1):
         model.train()
         t_loss = 0
-        loop = tqdm(train_loader, leave=False)
+        loop = tqdm(train_loader, leave=False, desc=f"Epoch [{epoch}/{EPOCHS}]")
         for imgs, targets, target_lens in loop:
             imgs = imgs.to(DEVICE)
             optimizer.zero_grad()
@@ -120,10 +139,8 @@ def train():
             loss.backward()
             optimizer.step()
             t_loss += loss.item()
-            loop.set_description(f"Epoch [{epoch}/{EPOCHS}]")
             loop.set_postfix(loss=loss.item())
 
-        # Validation
         model.eval()
         v_loss = 0
         with torch.no_grad():
@@ -139,17 +156,16 @@ def train():
         history['train_loss'].append(avg_train)
         history['test_loss'].append(avg_test)
 
-        print(f"Epoch {epoch}: Train Loss: {avg_train:.4f} | Test Loss: {avg_test:.4f}")
+        print(f"Epoch {epoch} | Train Loss: {avg_train:.4f} | Test Loss: {avg_test:.4f}")
         
         if avg_test < best_loss:
             best_loss = avg_test
             torch.save(model.state_dict(), "best_model.pth")
 
-    # Plotting
     plt.figure(figsize=(10, 5))
     plt.plot(history['train_loss'], label='Train Loss')
     plt.plot(history['test_loss'], label='Test Loss')
-    plt.title('Training Metrics')
+    plt.title('Training Metrics - Captcha Solver')
     plt.legend()
     plt.savefig('training_metrics.png')
     print("Training Complete. Model saved as best_model.pth")
