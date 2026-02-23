@@ -1,81 +1,73 @@
 import os
-import csv
-import base64
-import time
-from openai import OpenAI
-from PIL import Image
-import io
+import random
+import pandas as pd
+from PIL import Image, ImageDraw, ImageFont
+from tqdm import tqdm
 
-# 1. Configuration
-OPENROUTER_API_KEY = "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"
-PRIMARY_MODEL = "google/gemini-2.0-flash-001"
-FALLBACK_MODEL = "qwen/qwen-2.5-vl-72b-instruct" # Less restrictive
-FOLDER_PATH = 'captchas'
-OUTPUT_FILE = 'data.csv'
+# --- Config ---
+NUM_SAMPLES = 50000  # Generate 50k images to blast the DGX
+IMG_WIDTH, IMG_HEIGHT = 200, 50
+OUTPUT_DIR = 'synthetic_captchas/'
+CSV_FILE = 'synthetic_data.csv'
 
-client = OpenAI(
-    base_url="https://openrouter.ai/api/v1",
-    api_key=OPENROUTER_API_KEY,
-)
+# SASTRA characters
+CHARS = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 
-def encode_png_properly(image_path):
-    """Converts PNG to a flat JPEG to remove transparency/alpha issues."""
-    with Image.open(image_path) as img:
-        # PNGs often have alpha channels that turn black in some viewers
-        # We convert to RGB with a white background
-        canvas = Image.new("RGB", img.size, (255, 255, 255))
-        if img.mode == 'RGBA':
-            canvas.paste(img, mask=img.split()[3])
-        else:
-            canvas.paste(img)
-            
-        buffered = io.BytesIO()
-        canvas.save(buffered, format="JPEG")
-        return base64.b64encode(buffered.getvalue()).decode('utf-8')
+def generate_random_string(length=5):
+    """Generates a random alphanumeric string (5 or 6 chars)."""
+    return ''.join(random.choice(CHARS) for _ in range(length))
 
-# 2. Filter for PNG and limit to 100
-image_files = sorted([f for f in os.listdir(FOLDER_PATH) if f.endswith('.png')])
-image_files = image_files[1001:2000]
+def create_synthetic_captcha(text, filename):
+    # 1. Create a pure white background
+    img = Image.new('L', (IMG_WIDTH, IMG_HEIGHT), color=255)
+    draw = ImageDraw.Draw(img)
+    
+    # 2. Load a thick sans-serif font
+    # Note: On Linux/DGX, you might need to point this to a specific TTF file
+    # like '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf'
+    try:
+        font = ImageFont.truetype("DejaVuSans-Bold.ttf", 36) 
+    except IOError:
+        font = ImageFont.load_default()
 
-print(f"Processing {len(image_files)} PNG files...")
+    # 3. Draw tightly spaced text
+    # We add a slight random X offset, and keep Y centered
+    start_x = random.randint(10, 30)
+    for char in text:
+        # Draw character
+        draw.text((start_x, 2), char, font=font, fill=0)
+        # Advance X by a squished amount to simulate overlap (e.g., "ymm")
+        start_x += random.randint(22, 28) 
 
-with open(OUTPUT_FILE, mode='a', newline='', encoding='utf-8') as f:
-    writer = csv.writer(f)
-    writer.writerow(['filename', 'captcha_value'])
+    # 4. Draw the signature SASTRA thick black distractor line
+    # It usually starts middle-left and ends bottom-right
+    line_start = (random.randint(0, 20), random.randint(30, 40))
+    line_end = (random.randint(160, 190), random.randint(35, 45))
+    draw.line([line_start, line_end], fill=0, width=random.randint(2, 4))
 
-    for index, filename in enumerate(image_files):
-        img_path = os.path.join(FOLDER_PATH, filename)
+    # Save the image
+    img.save(os.path.join(OUTPUT_DIR, filename))
+
+def main():
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
+
+    data = []
+    print(f"Generating {NUM_SAMPLES} synthetic SASTRA captchas...")
+    
+    for i in tqdm(range(NUM_SAMPLES)):
+        # Randomly choose 5 or 6 characters
+        length = random.choice([5, 6])
+        text = generate_random_string(length)
+        filename = f"synth_{i}.png"
         
-        try:
-            b64_img = encode_png_properly(img_path)
-            
-            def get_prediction(model_name):
-                return client.chat.completions.create(
-                    model=model_name,
-                    messages=[{
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": "What are the characters in this captcha? Output ONLY the text."},
-                            {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}}
-                        ]
-                    }],
-                    temperature=0.1
-                ).choices[0].message.content.strip()
+        create_synthetic_captcha(text, filename)
+        data.append({"filename": filename, "captcha_value": text})
+        
+    # Save perfectly clean labels
+    df = pd.DataFrame(data)
+    df.to_csv(CSV_FILE, index=False)
+    print(f"Done! Dataset saved to {OUTPUT_DIR} and labels to {CSV_FILE}")
 
-            # Attempt with Gemini
-            result = get_prediction(PRIMARY_MODEL)
-
-            # If Gemini gives a long "Safety/Refusal" response, try Qwen
-            if len(result) > 10 or "unable" in result.lower():
-                print(f"[{index+1}] Gemini refused/failed. Retrying with Qwen...")
-                result = get_prediction(FALLBACK_MODEL)
-
-            writer.writerow([filename, result])
-            print(f"[{index+1}/100] {filename}: {result}")
-            time.sleep(1) # Safety delay
-
-        except Exception as e:
-            print(f"Failed {filename}: {e}")
-            writer.writerow([filename, "ERROR"])
-
-print(f"\nTask Complete! Data saved to {OUTPUT_FILE}")
+if __name__ == "__main__":
+    main()
