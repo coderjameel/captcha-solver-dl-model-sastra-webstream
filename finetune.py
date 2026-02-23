@@ -9,25 +9,28 @@ from PIL import Image, ImageFilter
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
-# --- Configuration for Fine-Tuning ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 IMG_WIDTH, IMG_HEIGHT = 200, 50
-BATCH_SIZE = 32         # Back to 32 for the smaller real dataset
-EPOCHS = 50             # 50 epochs is plenty for fine-tuning
-LEARNING_RATE = 0.0001  # VERY LOW: We don't want to destroy the pre-trained weights
-DATA_CSV = 'data_clean.csv'       # Back to REAL data
-IMG_DIR = 'captchas/'             # Back to REAL images
+BATCH_SIZE = 32         
+EPOCHS = 50             
+LEARNING_RATE = 0.0001  # Static, gentle learning rate
+DATA_CSV = 'data_clean.csv'       
+IMG_DIR = 'captchas/'             
 
 CHARS = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 CHAR_MAP = {char: i + 1 for i, char in enumerate(CHARS)}
 REV_MAP = {i + 1: char for i, char in enumerate(CHARS)}
 NUM_CLASSES = len(CHARS) + 1  
 
-# --- Preprocessing ---
-class CaptchaNoiseFilter:
+# --- THE MAGIC FIX: Make Real Data look Synthetic ---
+class CaptchaBinarizeFilter:
     def __call__(self, img):
         img = img.convert('L')
-        return img.filter(ImageFilter.MedianFilter(size=3))
+        # 1. Blur the thin line slightly
+        img = img.filter(ImageFilter.MedianFilter(size=3))
+        # 2. Force all gray/fuzzy pixels to pure black or pure white
+        # This removes the "Domain Gap" between real and synthetic
+        return img.point(lambda p: 255 if p > 140 else 0)
 
 class CaptchaDataset(Dataset):
     def __init__(self, df, root_dir, transform=None):
@@ -54,7 +57,6 @@ def collate_fn(batch):
     target_lens = torch.cat(target_lens, 0)
     return images, targets_padded, target_lens, raw_labels
 
-# --- Metrics ---
 def greedy_decoder(logits):
     pred_indices = logits.argmax(2).transpose(0, 1).cpu().numpy() 
     decoded_strings = []
@@ -77,7 +79,6 @@ def calculate_metrics(predictions, targets):
     char_acc = (correct_chars / total_chars) * 100 if total_chars > 0 else 0
     return word_acc, char_acc
 
-# --- CRNN Architecture (Must perfectly match your synthetic run) ---
 class CRNN(nn.Module):
     def __init__(self, num_classes):
         super(CRNN, self).__init__()
@@ -105,44 +106,32 @@ def finetune():
     df = pd.read_csv(DATA_CSV)
     train_df, test_df = train_test_split(df, test_size=0.1, random_state=42)
 
-    # Kept augmentation to prevent overfitting on the small 1.3k dataset
-    train_transform = transforms.Compose([
-        CaptchaNoiseFilter(),
-        transforms.Resize((IMG_HEIGHT, IMG_WIDTH)),
-        transforms.RandomRotation(2, fill=255),
-        transforms.ColorJitter(contrast=1.5),
-        transforms.ToTensor(),
-        transforms.Normalize((0.5,), (0.5,))
-    ])
-    
-    test_transform = transforms.Compose([
-        CaptchaNoiseFilter(),
+    # REMOVED Rotation and Jitter. Just binarize and resize.
+    transform = transforms.Compose([
+        CaptchaBinarizeFilter(),
         transforms.Resize((IMG_HEIGHT, IMG_WIDTH)),
         transforms.ToTensor(),
         transforms.Normalize((0.5,), (0.5,))
     ])
 
-    train_loader = DataLoader(CaptchaDataset(train_df, IMG_DIR, train_transform), 
+    train_loader = DataLoader(CaptchaDataset(train_df, IMG_DIR, transform), 
                               batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn, num_workers=4)
-    test_loader = DataLoader(CaptchaDataset(test_df, IMG_DIR, test_transform), 
+    test_loader = DataLoader(CaptchaDataset(test_df, IMG_DIR, transform), 
                              batch_size=BATCH_SIZE, collate_fn=collate_fn, num_workers=4)
 
     model = CRNN(NUM_CLASSES).to(DEVICE)
     
-    # --- TRANSFER LEARNING: Load the Winning Weights ---
     print("🧠 Loading Pre-trained Weights from synthetic_best_model.pth...")
     try:
-        model.load_state_dict(torch.load("synthetic_best_model.pth", weights_only=True))
+        model.load_state_dict(torch.load("synthetic_best_model.pth", map_location=DEVICE, weights_only=True))
         print("✅ Pre-trained weights loaded successfully!")
     except Exception as e:
         print(f"❌ Error loading weights: {e}")
         return
 
     criterion = nn.CTCLoss(blank=0, zero_infinity=True)
-    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
-    
-    # Gentle scheduler
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
+    # Using Adam instead of AdamW, and NO scheduler so the LR stays at 0.0001
+    optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
 
     best_word_acc = 0.0
 
@@ -194,15 +183,12 @@ def finetune():
 
         avg_val_loss = val_loss / len(test_loader)
         val_w_acc, val_c_acc = calculate_metrics(val_preds, val_targets)
-        
-        scheduler.step(avg_val_loss)
-        curr_lr = optimizer.param_groups[0]['lr']
 
-        print(f"\n[EPOCH {epoch:03d}/{EPOCHS}] LR: {curr_lr:.6f}")
+        print(f"\n[EPOCH {epoch:03d}/{EPOCHS}] LR: {optimizer.param_groups[0]['lr']:.6f}")
         print(f" ┣▶ TRAIN | Loss: {avg_train_loss:.4f} | Char Acc: {train_c_acc:5.2f}% | Word Acc: {train_w_acc:5.2f}%")
         print(f" ┗▶ TEST  | Loss: {avg_val_loss:.4f} | Char Acc: {val_c_acc:5.2f}% | Word Acc: {val_w_acc:5.2f}%")
         
-        if epoch % 5 == 0 or val_w_acc > 50.0:
+        if epoch % 5 == 0 or val_w_acc > 5.0:
             print(f"    * Sample - True: '{val_targets[0]}' | Pred: '{val_preds[0]}'")
 
         if val_w_acc >= best_word_acc and val_w_acc > 0:
