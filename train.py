@@ -9,13 +9,14 @@ from PIL import Image, ImageFilter
 from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 
-# --- Configuration for DGX Node ---
+# --- Configuration for 50k Synthetic Dataset ---
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 IMG_WIDTH, IMG_HEIGHT = 200, 50
-BATCH_SIZE = 32         # Reduced to force more frequent weight updates
-EPOCHS = 200
-LEARNING_RATE = 0.0005  # Steady initial learning rate
-DATA_CSV = 'data_clean.csv'
+BATCH_SIZE = 64         # Bumped up safely for the larger dataset
+EPOCHS = 50             # 50 epochs on 50k images is massive training time
+LEARNING_RATE = 0.0005  
+DATA_CSV = 'synthetic_data.csv'       # Pointing to new dataset
+IMG_DIR = 'synthetic_captchas/'       # Pointing to new dataset
 
 CHARS = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
 CHAR_MAP = {char: i + 1 for i, char in enumerate(CHARS)}
@@ -24,7 +25,6 @@ NUM_CLASSES = len(CHARS) + 1
 
 # --- Advanced Preprocessing ---
 class CaptchaNoiseFilter:
-    """Applies a median filter to blur out thin background lines."""
     def __call__(self, img):
         img = img.convert('L')
         return img.filter(ImageFilter.MedianFilter(size=3))
@@ -109,7 +109,10 @@ class CRNN(nn.Module):
         return self.fc(x)
 
 def train():
+    print(f"🚀 Loading {DATA_CSV}...")
     df = pd.read_csv(DATA_CSV)
+    
+    # DGX I/O Optimization: Virtual Split (No file copying)
     train_df, test_df = train_test_split(df, test_size=0.1, random_state=42)
 
     train_transform = transforms.Compose([
@@ -128,22 +131,22 @@ def train():
         transforms.Normalize((0.5,), (0.5,))
     ])
 
-    train_loader = DataLoader(CaptchaDataset(train_df, 'captchas/', train_transform), 
-                              batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
-    test_loader = DataLoader(CaptchaDataset(test_df, 'captchas/', test_transform), 
-                             batch_size=BATCH_SIZE, collate_fn=collate_fn)
+    # Using num_workers=4 for lightning-fast multi-core image loading
+    train_loader = DataLoader(CaptchaDataset(train_df, IMG_DIR, train_transform), 
+                              batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn, num_workers=4)
+    test_loader = DataLoader(CaptchaDataset(test_df, IMG_DIR, test_transform), 
+                             batch_size=BATCH_SIZE, collate_fn=collate_fn, num_workers=4)
 
     model = CRNN(NUM_CLASSES).to(DEVICE)
     criterion = nn.CTCLoss(blank=0, zero_infinity=True)
     optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
     
-    # Patient scheduler: Drops LR only if validation loss stops improving for 15 epochs
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=15, factor=0.5)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=5, factor=0.5)
 
     best_word_acc = 0.0
 
     print("="*80)
-    print(f"🚀 INITIATING STABILIZED TRAINING ON {DEVICE.type.upper()}")
+    print(f"🔥 INITIATING MASSIVE SYNTHETIC TRAINING ON {DEVICE.type.upper()}")
     print(f"Total Epochs: {EPOCHS} | Batch Size: {BATCH_SIZE} | Dataset: {len(df)} images")
     print("="*80)
 
@@ -192,7 +195,6 @@ def train():
         avg_val_loss = val_loss / len(test_loader)
         val_w_acc, val_c_acc = calculate_metrics(val_preds, val_targets)
         
-        # Step the scheduler based on the validation loss
         scheduler.step(avg_val_loss)
         curr_lr = optimizer.param_groups[0]['lr']
 
@@ -205,12 +207,8 @@ def train():
 
         if val_w_acc >= best_word_acc and val_w_acc > 0:
             best_word_acc = val_w_acc
-            torch.save(model.state_dict(), "best_model.pth")
+            torch.save(model.state_dict(), "synthetic_best_model.pth")
             print(f" 🌟 NEW BEST MODEL SAVED! Word Accuracy: {best_word_acc:.2f}%")
-
-    print("\n" + "="*80)
-    print(f"🎉 TRAINING COMPLETE. Maximum Test Word Accuracy achieved: {best_word_acc:.2f}%")
-    print("="*80)
 
 if __name__ == "__main__":
     train()

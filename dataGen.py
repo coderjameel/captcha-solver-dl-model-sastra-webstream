@@ -7,7 +7,7 @@ from tqdm import tqdm
 # --- Config ---
 NUM_SAMPLES = 50000  # Generate 50k images to blast the DGX
 IMG_WIDTH, IMG_HEIGHT = 200, 50
-OUTPUT_DIR = 'synthetic_captchas/'
+OUTPUT_DIR = 'syn_captchas/'
 CSV_FILE = 'synthetic_data.csv'
 
 # SASTRA characters
